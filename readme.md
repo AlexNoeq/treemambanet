@@ -7,6 +7,7 @@ ForestMamba is a forest tree instance segmentation model built on a **sparse Mam
 - 📄 [Paper on arXiv](https://arxiv.org/abs/2606.01549)
 - 📦 [Dataset on Zenodo](https://zenodo.org/records/16742708)
 - 🔗 [Pre-trained ForestMamba checkpoint (Google Drive)](https://drive.google.com/drive/folders/1wf_IcXNIZgxOg_Dkrt45ph2ssdBeWCHm?usp=sharing)
+- 🚀 The released pre-trained checkpoint outperforms the results reported in the paper. This checkpoint was trained with synchronized BatchNorm (SyncBatchNorm) across GPUs, whereas the paper results used standard BatchNorm.
 
 ---
 
