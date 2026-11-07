@@ -105,7 +105,8 @@ class UnifiedSegMetric(SegMetric):
                                                 pan_gt['pts_instance_mask'],
                                                 return_inverse=True)[1]
                 gt_masks_pan.append(pan_gt)
-            elif self.metric_meta['dataset_name'] == 'ForAINetV2':
+            elif self.metric_meta['dataset_name'] in (
+                    'ForAINetV2', 'WHU-Stree'):
                 pan_gt = {}
                 pan_gt['pts_semantic_mask'] = eval_ann['pts_semantic_mask'].copy()
                 pan_gt['pts_instance_mask'] = \
@@ -140,7 +141,8 @@ class UnifiedSegMetric(SegMetric):
             if self.metric_meta['dataset_name'] == 'S3DIS':
                 gt_semantic_masks_inst_task.append(eval_ann['pts_semantic_mask'])
                 gt_instance_masks_inst_task.append(eval_ann['pts_instance_mask'])  
-            elif self.metric_meta['dataset_name'] == 'ForAINetV2':
+            elif self.metric_meta['dataset_name'] in (
+                    'ForAINetV2', 'WHU-Stree'):
                 pan_gt = {}
                 pan_gt['pts_semantic_mask'] = eval_ann['pts_semantic_mask'].copy()
                 pan_gt['pts_instance_mask'] = \
@@ -235,6 +237,17 @@ class UnifiedSegMetric(SegMetric):
                 pred_instance_scores,
                 valid_class_ids=self.valid_class_ids[num_stuff_cls:-1], #self.valid_class_ids[num_stuff_cls:],
                 class_labels=['tree'], #classes[num_stuff_cls:],
+                logger=logger)
+        elif self.metric_meta['dataset_name'] == 'WHU-Stree':
+            # WHU-Stree contains one thing class (tree) plus ground as stuff.
+            ret_inst = instance_seg_eval(
+                gt_semantic_masks_inst_task,
+                gt_instance_masks_inst_task,
+                pred_instance_masks_inst_task,
+                pred_instance_labels,
+                pred_instance_scores,
+                valid_class_ids=self.valid_class_ids[num_stuff_cls:],
+                class_labels=classes[num_stuff_cls:],
                 logger=logger)
         else:
             # :-1 for unlabeled

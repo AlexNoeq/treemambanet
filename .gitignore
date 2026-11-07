@@ -21,7 +21,8 @@ wytham_lautx.zip
 wandb
 .dist_test
 Ralph
-tests
+tests/*
+!tests/test_mamba_aggregation.py
 viz/save
 paper
 logs

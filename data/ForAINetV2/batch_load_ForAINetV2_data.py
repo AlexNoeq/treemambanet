@@ -16,13 +16,8 @@ from os import path as osp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-import torch
-import segmentator
-import open3d as o3d
 import numpy as np
 from load_forainetv2_data import export
-from plyutils import read_ply
-from scipy.spatial import Delaunay
 
 DONOTCARE_CLASS_IDS = np.array([])
 
@@ -107,8 +102,14 @@ def export_one_scan(scan_name,
 def process_one_scan(args):
     scan_name, output_folder, max_num_point, forainetv2_dir, test_mode = args
     output_filename_prefix = osp.join(output_folder, scan_name)
-    if osp.isfile(f'{output_filename_prefix}_vert.npy'):
-        print(f'[{scan_name}] File already exists. skipping.')
+    required_outputs = ['vert', 'offsets']
+    if not test_mode:
+        required_outputs.extend([
+            'sem_label', 'ins_label', 'unaligned_bbox', 'aligned_bbox',
+            'axis_align_matrix'])
+    if all(osp.isfile(f'{output_filename_prefix}_{suffix}.npy')
+           for suffix in required_outputs):
+        print(f'[{scan_name}] All output files already exist. skipping.')
         return
     print(f'[{datetime.datetime.now()}] Processing: {scan_name}')
     try:
@@ -117,6 +118,7 @@ def process_one_scan(args):
         print(f'[{scan_name}] Done.')
     except Exception as e:
         print(f'[{scan_name}] Failed: {e}')
+        raise
 
 
 def batch_export(max_num_point,

@@ -2585,6 +2585,34 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         regions = self.generate_cylindrical_regions(
             original_points, self.radius, step_size)
 
+        # Index points into step-sized XY cells once. The previous implementation
+        # scanned every point for every cylinder, which is prohibitively costly
+        # for large forest tiles. A cylinder can only intersect cells within
+        # ceil(radius / step_size) cells of its center.
+        xy_cpu = original_points[:, :2].detach().cpu().numpy()
+        x_origin = float(xy_cpu[:, 0].min())
+        y_origin = float(xy_cpu[:, 1].min())
+        x_extent = float(xy_cpu[:, 0].max()) - x_origin
+        y_extent = float(xy_cpu[:, 1].max()) - y_origin
+        n_x_cells = int(math.floor(x_extent / step_size)) + 1
+        n_y_cells = int(math.floor(y_extent / step_size)) + 1
+        cell_x = np.floor(
+            (xy_cpu[:, 0] - x_origin) / step_size).astype(np.int32)
+        cell_y = np.floor(
+            (xy_cpu[:, 1] - y_origin) / step_size).astype(np.int32)
+        cell_x = np.clip(cell_x, 0, n_x_cells - 1)
+        cell_y = np.clip(cell_y, 0, n_y_cells - 1)
+        cell_ids = cell_x * n_y_cells + cell_y
+        cell_order = np.argsort(cell_ids).astype(np.int32, copy=False)
+        cell_counts = np.bincount(
+            cell_ids, minlength=n_x_cells * n_y_cells)
+        cell_starts = np.empty(len(cell_counts) + 1, dtype=np.int64)
+        cell_starts[0] = 0
+        np.cumsum(cell_counts, out=cell_starts[1:])
+        del xy_cpu, cell_x, cell_y, cell_ids, cell_counts
+        neighbor_cells = int(math.ceil(self.radius / step_size))
+        point_device = original_points.device
+
         # Global buffers accumulated over all windows.
         N_total = original_points.shape[0]
         votes_counter          = np.zeros((N_total, num_cls), dtype=np.int16)
@@ -2606,12 +2634,32 @@ class ForAINetV2OneFormer3D_XAwarequery(Base3DDetector):
         last_results, last_originids = None, None
 
         for region in tqdm(regions, desc=f"[{current_filename}] Processing regions"):
-            # (1) Grab points inside this cylinder (squared distance avoids sqrt).
-            dx = original_points[:, 0] - region[0]
-            dy = original_points[:, 1] - region[1]
+            # (1) Gather nearby XY cells, then apply the exact cylinder test.
+            center_x = int(round((region[0] - x_origin) / step_size))
+            center_y = int(round((region[1] - y_origin) / step_size))
+            cell_slices = []
+            for cell_x_idx in range(
+                    max(0, center_x - neighbor_cells),
+                    min(n_x_cells, center_x + neighbor_cells + 1)):
+                for cell_y_idx in range(
+                        max(0, center_y - neighbor_cells),
+                        min(n_y_cells, center_y + neighbor_cells + 1)):
+                    cell_id = cell_x_idx * n_y_cells + cell_y_idx
+                    start = cell_starts[cell_id]
+                    end = cell_starts[cell_id + 1]
+                    if end > start:
+                        cell_slices.append(cell_order[start:end])
+            if not cell_slices:
+                continue
+            candidates_np = np.concatenate(cell_slices)
+            candidates = torch.as_tensor(
+                candidates_np, dtype=torch.long, device=point_device)
+            candidate_points = original_points[candidates]
+            dx = candidate_points[:, 0] - region[0]
+            dy = candidate_points[:, 1] - region[1]
             region_mask = (dx * dx + dy * dy) <= radius_sq
-            pc1_indices = torch.where(region_mask)[0]
-            pc1 = original_points[region_mask]
+            pc1_indices = candidates[region_mask]
+            pc1 = original_points[pc1_indices]
             if len(pc1) == 0:
                 continue
 
@@ -4527,127 +4575,13 @@ class ForAINetV2OneFormer3D_CHMquery(ForAINetV2OneFormer3D_XAwarequery):
         return combined_feats, combined_labels
 
 
-@MODELS.register_module()
-class ForAINetV2OneFormer3D_CHMquery_Spatial(ForAINetV2OneFormer3D_CHMquery):
-    """v5: CHMquery + spatial coordinate passing to the SSM decoder.
+class _SpatialQueryMixin:
+    """Pass query/source XYZ through training and all inference paths."""
 
-    Identical to :class:`ForAINetV2OneFormer3D_CHMquery` except that after
-    query sampling it passes two coordinate tensors to the decoder:
-
-    * ``query_xyzs`` — 3-D world positions of each query seed (CHM peak
-      centres at (peak_x, peak_y, chm_height) + FPS-selected voxel centres).
-    * ``src_xyzs`` — mean world-XYZ of each superpoint, used by
-      ``MambaAggregation`` for spatial k-NN (instead of feature-space k-NN).
-
-    These coordinates activate the full LaSSM spatial operations that are
-    otherwise skipped in v4 due to the feature-space fallback.
-    """
-
-    # ------------------------------------------------------------------
-    # Query sampling with position tracking
-    # ------------------------------------------------------------------
-
-    def _sample_queries(self, backbone_feats, embed_feats_tree, xyz_voxels,
-                        tree_indices, voxel_instance_labels, max_queries):
-        """Same logic as CHMquery but also stores query XYZ in self._query_xyzs_cache."""
-        device = backbone_feats.device
-
-        # ── Fallback: no tree voxels ─────────────────────────────────────
-        if tree_indices.numel() == 0:
-            feats, labels = super()._sample_queries(
-                backbone_feats, embed_feats_tree, xyz_voxels,
-                tree_indices, voxel_instance_labels, max_queries)
-            n = feats.shape[0]
-            self._query_xyzs_cache = xyz_voxels[:n, :3].float()
-            return feats, labels
-
-        # ── CHM peak detection (mirrors parent logic exactly) ─────────────
-        tree_pts = xyz_voxels[tree_indices, :3].detach().cpu().float()
-        xy_np    = tree_pts[:, :2].numpy()
-        z_np     = tree_pts[:, 2].numpy()
-        xy_min   = xy_np.min(axis=0)
-        res      = self.chm_resolution
-
-        col_idx  = np.floor((xy_np[:, 0] - xy_min[0]) / res).astype(np.int32)
-        row_idx  = np.floor((xy_np[:, 1] - xy_min[1]) / res).astype(np.int32)
-        n_cols   = int(col_idx.max()) + 1
-        n_rows   = int(row_idx.max()) + 1
-
-        chm            = np.full((n_rows, n_cols), -np.inf, dtype=np.float32)
-        np.maximum.at(chm, (row_idx, col_idx), z_np)
-        occupied       = chm > -np.inf
-        chm[~occupied] = 0.0
-
-        peak_rows, peak_cols = self._detect_chm_peaks(chm, occupied, res)
-
-        # ── Fallback: no CHM peaks → FPS with position tracking ───────────
-        if len(peak_rows) == 0:
-            feats, labels, xyzs = self._fps_with_xyz(
-                backbone_feats, embed_feats_tree, xyz_voxels,
-                tree_indices, voxel_instance_labels, max_queries, device)
-            self._n_chm_queries  = 0
-            self._query_xyzs_cache = xyzs
-            return feats, labels
-
-        # ── Trim to budget by tallest peaks ────────────────────────────────
-        peak_x   = peak_cols * res + xy_min[0] + res * 0.5
-        peak_y   = peak_rows * res + xy_min[1] + res * 0.5
-        peak_xy_np = np.stack([peak_x, peak_y], axis=1)
-
-        if len(peak_rows) > max_queries:
-            peak_z_arr = chm[peak_rows, peak_cols]
-            order      = np.argsort(-peak_z_arr)[:max_queries]
-            peak_rows  = peak_rows[order]
-            peak_cols  = peak_cols[order]
-            peak_xy_np = peak_xy_np[order]
-
-        peak_z_vals  = chm[peak_rows, peak_cols]                      # (P,)
-        peak_xyz_np  = np.stack(
-            [peak_xy_np[:, 0], peak_xy_np[:, 1], peak_z_vals], axis=1)  # (P, 3)
-        chm_xyzs     = torch.from_numpy(peak_xyz_np).float().to(device)
-
-        # ── Cylinder feature pooling ───────────────────────────────────────
-        peak_xy_t   = torch.from_numpy(peak_xy_np).float().to(device)
-        xy_voxels_t = xyz_voxels[:, :2].float()
-        chm_feats   = self._cylinder_pool(
-            backbone_feats, xy_voxels_t, peak_xy_t, self.chm_pool_radius)
-
-        # ── Instance labels for CHM queries ────────────────────────────────
-        if voxel_instance_labels is not None:
-            diff_all    = peak_xy_t.unsqueeze(1) - xy_voxels_t.unsqueeze(0)
-            dist_sq_all = (diff_all ** 2).sum(-1)
-            nearest_vox = dist_sq_all.argmin(dim=1)
-            chm_labels  = voxel_instance_labels[nearest_vox]
-        else:
-            chm_labels = None
-
-        # ── FPS supplement ────────────────────────────────────────────────
-        n_chm        = chm_feats.shape[0]
-        self._n_chm_queries = n_chm
-        n_fps_needed = max_queries - n_chm
-
-        if n_fps_needed <= 0 or embed_feats_tree.size(0) == 0:
-            self._query_xyzs_cache = chm_xyzs
-            combined_labels = chm_labels
-            return chm_feats, combined_labels
-
-        fps_feats, fps_labels, fps_xyzs = self._fps_with_xyz(
-            backbone_feats, embed_feats_tree, xyz_voxels,
-            tree_indices, voxel_instance_labels, n_fps_needed, device)
-
-        combined_feats = torch.cat([chm_feats, fps_feats.to(device)], dim=0)
-        combined_xyzs  = torch.cat([chm_xyzs,  fps_xyzs.to(device)],  dim=0)
-
-        if chm_labels is not None and fps_labels is not None:
-            combined_labels = torch.cat(
-                [chm_labels, fps_labels.to(device)], dim=0)
-        elif chm_labels is not None:
-            combined_labels = chm_labels
-        else:
-            combined_labels = fps_labels
-
-        self._query_xyzs_cache = combined_xyzs
-        return combined_feats, combined_labels
+    def _query_auxiliary_losses(self, voxel_features, batch_inputs_dict,
+                                batch_data_samples, coordinates, inverse_mapping):
+        """Optional supervision for learned query initializers, including warm-up."""
+        return {}
 
     def _fps_with_xyz(self, backbone_feats, embed_feats_tree, xyz_voxels,
                       tree_indices, voxel_instance_labels, max_queries, device):
@@ -4682,6 +4616,9 @@ class ForAINetV2OneFormer3D_CHMquery_Spatial(ForAINetV2OneFormer3D_CHMquery):
             features, coordinates, spatial_shape, len(batch_data_samples))
 
         x = self.extract_feat(x)
+
+        query_auxiliary_losses = self._query_auxiliary_losses(
+            x, batch_inputs_dict, batch_data_samples, coordinates, inverse_mapping)
 
         embed_logits      = [self.Embed(y) for y in x]
         bi_semantic_logits = [self.BiSemantic(y) for y in x]
@@ -4727,6 +4664,7 @@ class ForAINetV2OneFormer3D_CHMquery_Spatial(ForAINetV2OneFormer3D_CHMquery):
             'discriminative_loss': total_discriminative_loss,
             'semantic_loss_bi':    total_semantic_loss_bi,
         }
+        loss_final.update(query_auxiliary_losses)
 
         queries          = []
         queries_inslabel = []
@@ -4902,7 +4840,7 @@ class ForAINetV2OneFormer3D_CHMquery_Spatial(ForAINetV2OneFormer3D_CHMquery):
         lidar_path = batch_data_samples[0].lidar_path
 
         # ----- Validation path: pass spatial coords to decoder -----
-        if 'test' not in lidar_path:
+        if kwargs.pop('validation_only', False) or 'test' not in lidar_path:
             coordinates, features, inverse_mapping, spatial_shape = self.collate(
                 batch_inputs_dict['points'])
             x = spconv.SparseConvTensor(
@@ -4935,7 +4873,7 @@ class ForAINetV2OneFormer3D_CHMquery_Spatial(ForAINetV2OneFormer3D_CHMquery):
                              if hasattr(self, '_query_xyzs_cache') else None)
                 else:
                     q_feats = x[i][:min(self.query_point_num, len(x[i]))]
-                    q_xyz   = None
+                    q_xyz   = vox_xyz[:len(q_feats), :3].float()
 
                 queries.append(q_feats)
                 query_xyzs_list.append(q_xyz)
@@ -4953,6 +4891,170 @@ class ForAINetV2OneFormer3D_CHMquery_Spatial(ForAINetV2OneFormer3D_CHMquery):
 
         # ----- Test / sliding-window path: delegate to parent -----
         return super().predict(batch_inputs_dict, batch_data_samples, **kwargs)
+
+
+@MODELS.register_module()
+class ForAINetV2OneFormer3D_CHMquery_Spatial(
+        _SpatialQueryMixin, ForAINetV2OneFormer3D_CHMquery):
+    """v5: CHMquery + spatial coordinate passing to the SSM decoder.
+
+    Identical to :class:`ForAINetV2OneFormer3D_CHMquery` except that after
+    query sampling it passes two coordinate tensors to the decoder:
+
+    * ``query_xyzs`` — 3-D world positions of each query seed (CHM peak
+      centres at (peak_x, peak_y, chm_height) + FPS-selected voxel centres).
+    * ``src_xyzs`` — mean world-XYZ of each superpoint, used by
+      ``MambaAggregation`` for spatial k-NN (instead of feature-space k-NN).
+
+    These coordinates activate the full LaSSM spatial operations that are
+    otherwise skipped in v4 due to the feature-space fallback.
+    """
+
+    # ------------------------------------------------------------------
+    # Query sampling with position tracking
+    # ------------------------------------------------------------------
+
+    def _sample_queries(self, backbone_feats, embed_feats_tree, xyz_voxels,
+                        tree_indices, voxel_instance_labels, max_queries):
+        """Same logic as CHMquery but also stores query XYZ in self._query_xyzs_cache."""
+        device = backbone_feats.device
+
+        # ── Fallback: no tree voxels ─────────────────────────────────────
+        if tree_indices.numel() == 0:
+            feats, labels = super()._sample_queries(
+                backbone_feats, embed_feats_tree, xyz_voxels,
+                tree_indices, voxel_instance_labels, max_queries)
+            n = feats.shape[0]
+            self._query_xyzs_cache = xyz_voxels[:n, :3].float()
+            return feats, labels
+
+        # ── CHM peak detection (mirrors parent logic exactly) ─────────────
+        tree_pts = xyz_voxels[tree_indices, :3].detach().cpu().float()
+        xy_np    = tree_pts[:, :2].numpy()
+        z_np     = tree_pts[:, 2].numpy()
+        xy_min   = xy_np.min(axis=0)
+        res      = self.chm_resolution
+
+        col_idx  = np.floor((xy_np[:, 0] - xy_min[0]) / res).astype(np.int32)
+        row_idx  = np.floor((xy_np[:, 1] - xy_min[1]) / res).astype(np.int32)
+        n_cols   = int(col_idx.max()) + 1
+        n_rows   = int(row_idx.max()) + 1
+
+        chm            = np.full((n_rows, n_cols), -np.inf, dtype=np.float32)
+        np.maximum.at(chm, (row_idx, col_idx), z_np)
+        occupied       = chm > -np.inf
+        chm[~occupied] = 0.0
+
+        peak_rows, peak_cols = self._detect_chm_peaks(chm, occupied, res)
+
+        # ── Fallback: no CHM peaks → FPS with position tracking ───────────
+        if len(peak_rows) == 0:
+            feats, labels, xyzs = self._fps_with_xyz(
+                backbone_feats, embed_feats_tree, xyz_voxels,
+                tree_indices, voxel_instance_labels, max_queries, device)
+            self._n_chm_queries  = 0
+            self._query_xyzs_cache = xyzs
+            return feats, labels
+
+        # ── Trim to budget by tallest peaks ────────────────────────────────
+        peak_x   = peak_cols * res + xy_min[0] + res * 0.5
+        peak_y   = peak_rows * res + xy_min[1] + res * 0.5
+        peak_xy_np = np.stack([peak_x, peak_y], axis=1)
+
+        if len(peak_rows) > max_queries:
+            peak_z_arr = chm[peak_rows, peak_cols]
+            order      = np.argsort(-peak_z_arr)[:max_queries]
+            peak_rows  = peak_rows[order]
+            peak_cols  = peak_cols[order]
+            peak_xy_np = peak_xy_np[order]
+
+        peak_z_vals  = chm[peak_rows, peak_cols]                      # (P,)
+        peak_xyz_np  = np.stack(
+            [peak_xy_np[:, 0], peak_xy_np[:, 1], peak_z_vals], axis=1)  # (P, 3)
+        chm_xyzs     = torch.from_numpy(peak_xyz_np).float().to(device)
+
+        # ── Cylinder feature pooling ───────────────────────────────────────
+        peak_xy_t   = torch.from_numpy(peak_xy_np).float().to(device)
+        xy_voxels_t = xyz_voxels[:, :2].float()
+        chm_feats   = self._cylinder_pool(
+            backbone_feats, xy_voxels_t, peak_xy_t, self.chm_pool_radius)
+
+        # ── Instance labels for CHM queries ────────────────────────────────
+        if voxel_instance_labels is not None:
+            diff_all    = peak_xy_t.unsqueeze(1) - xy_voxels_t.unsqueeze(0)
+            dist_sq_all = (diff_all ** 2).sum(-1)
+            nearest_vox = dist_sq_all.argmin(dim=1)
+            chm_labels  = voxel_instance_labels[nearest_vox]
+        else:
+            chm_labels = None
+
+        # ── FPS supplement ────────────────────────────────────────────────
+        n_chm        = chm_feats.shape[0]
+        self._n_chm_queries = n_chm
+        n_fps_needed = max_queries - n_chm
+
+        if n_fps_needed <= 0 or embed_feats_tree.size(0) == 0:
+            self._query_xyzs_cache = chm_xyzs
+            combined_labels = chm_labels
+            return chm_feats, combined_labels
+
+        fps_feats, fps_labels, fps_xyzs = self._fps_with_xyz(
+            backbone_feats, embed_feats_tree, xyz_voxels,
+            tree_indices, voxel_instance_labels, n_fps_needed, device)
+
+        combined_feats = torch.cat([chm_feats, fps_feats.to(device)], dim=0)
+        combined_xyzs  = torch.cat([chm_xyzs,  fps_xyzs.to(device)],  dim=0)
+
+        if chm_labels is not None and fps_labels is not None:
+            combined_labels = torch.cat(
+                [chm_labels, fps_labels.to(device)], dim=0)
+        elif chm_labels is not None:
+            combined_labels = chm_labels
+        else:
+            combined_labels = fps_labels
+
+        self._query_xyzs_cache = combined_xyzs
+        return combined_feats, combined_labels
+
+
+@MODELS.register_module()
+class ForAINetV2OneFormer3D_FPS_Spatial(
+        _SpatialQueryMixin, ForAINetV2OneFormer3D_XAwarequery):
+    """Embedding-FPS queries with spatial decoder inputs and no CHM modules."""
+
+    def val_step(self, data, epoch=None):
+        """Evaluate sampled validation regions even when paths contain 'test'."""
+        data = self.data_preprocessor(data, False)
+        return self(**data, mode='predict', epoch=epoch, validation_only=True)
+
+    def _sample_queries(self, backbone_feats, embed_feats_tree, xyz_voxels,
+                        tree_indices, voxel_instance_labels, max_queries):
+        self._n_chm_queries = 0
+        if tree_indices.numel() == 0:
+            n = min(max_queries, backbone_feats.shape[0])
+            self._query_xyzs_cache = xyz_voxels[:n, :3].float()
+            labels = (voxel_instance_labels[:n]
+                      if voxel_instance_labels is not None else None)
+            return backbone_feats[:n], labels
+        features, labels, xyzs = self._fps_with_xyz(
+            backbone_feats, embed_feats_tree, xyz_voxels, tree_indices,
+            voxel_instance_labels, max_queries, backbone_feats.device)
+        self._query_xyzs_cache = xyzs
+        return features, labels
+
+    def collate(self, points, elastic_points=None):
+        coordinates, features, inverse_mapping, spatial_shape = \
+            super().collate(points, elastic_points)
+        # The recursive U-Net downsamples by two at each level. Pad the
+        # declared sparse tensor bounds to that total factor so a non-divisible
+        # extent (for example Z=184) cannot lose its last active voxel.
+        num_downsamples = max(len(self.unet.num_planes) - 1, 0)
+        downsample_factor = 2 ** num_downsamples
+        if downsample_factor > 1:
+            spatial_shape = (
+                (spatial_shape + downsample_factor - 1) // downsample_factor
+            ) * downsample_factor
+        return coordinates, features, inverse_mapping, spatial_shape
 
 
 @MODELS.register_module()
@@ -4982,6 +5084,20 @@ class ForAINetV2OneFormer3D_CHMquery_MultiScale(
         self.chm_resolution_fine   = chm_resolution_fine
         self.chm_resolution_coarse = chm_resolution_coarse
         self.chm_min_peak_dist     = chm_min_peak_dist
+
+    def collate(self, points, elastic_points=None):
+        coordinates, features, inverse_mapping, spatial_shape = \
+            super().collate(points, elastic_points)
+        # The recursive U-Net downsamples by two at each level. Pad the
+        # declared sparse tensor bounds to that total factor so a non-divisible
+        # extent (for example Z=184) cannot lose its last active voxel.
+        num_downsamples = max(len(self.unet.num_planes) - 1, 0)
+        downsample_factor = 2 ** num_downsamples
+        if downsample_factor > 1:
+            spatial_shape = (
+                (spatial_shape + downsample_factor - 1) // downsample_factor
+            ) * downsample_factor
+        return coordinates, features, inverse_mapping, spatial_shape
 
     # ------------------------------------------------------------------
     # Multi-scale CHM peak collection with spatial NMS
@@ -6019,4 +6135,3 @@ class InstanceOnlyOneFormer3D(Base3DDetector):
                 instance_labels=labels,
                 instance_scores=scores)
         ]
-

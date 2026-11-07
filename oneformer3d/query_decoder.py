@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS
+from .spatial_order import hilbert_sort, z_order_sort, hz_sort
 
 
 class CrossAttentionLayer(BaseModule):
@@ -766,9 +767,12 @@ class ForAINetv2QueryDecoder_XAwarequery(BaseModule):
             scores=pred_scores[-1],
             aux_outputs=aux_outputs)
 
-    def forward(self, x, queries=None):
+    def forward(self, x, queries=None, query_xyzs=None, src_xyzs=None):
         """Forward pass.
-        
+
+        XYZ arguments provide compatibility with the shared FPS model;
+        this Transformer decoder uses attention on the input features.
+
         Args:
             x (List[Tensor]): of len batch_size, each of shape
                 (n_points_i, in_channels).
@@ -885,9 +889,13 @@ class SSMSpatialSelfLayer(nn.Module):
     Faithful to the LaSSM paper's SSM class:
 
     1. Apply pre-norm to queries.
-    2. Sort queries by two complementary spatial orderings (ascending and
-       descending slab-order, approximating Hilbert + Hilbert-transposed).
-    3. Stack both orderings as a batch: shape (2, Q, d).
+    2. Sort queries by one or two spatial orderings (ascending and
+       descending slab-order, Hilbert / Hilbert-transposed curves, or the
+       forward and reverse traversal of the same Hilbert curve, or two
+       identical forward Hilbert or Z-order traversals, or Z-order paired
+       with Z-order-transposed). HZ supports a single traversal or a
+       forward/reverse pair; HZ-swap uses a single X/Y-swapped traversal.
+    3. Stack orderings as a batch: shape (num_orders, Q, d).
     4. Pass through a **single shared Mamba instance** — both orderings use
        the same weights (batch dimension = orderings, identical to the paper).
     5. Unsort each ordering back to the original query positions.
@@ -904,13 +912,36 @@ class SSMSpatialSelfLayer(nn.Module):
         d_conv (int): Mamba depthwise-conv kernel width.
         expand (int): Mamba inner expansion factor.
         slab_thickness (float): Z-axis bin width for spatial slab ordering.
+        serialization_order (str): 'slab', 'hilbert' (with transposed curve),
+            'hilbert-bidirectional' (forward/reverse of one curve), or
+            'hilbert-identical' (the same forward traversal twice), or
+            'z-order' (the same forward Morton traversal twice), or
+            'z-order-trans' (Morton and X/Y-transposed Morton traversals),
+            'hz-bidirectional' (HZ forward/reverse), 'hz' (single HZ), or
+            'hz-swap' (single HZ with X/Y swapped).
+        serialization_grid_size (float): XYZ quantization size for spatial curves.
+        hz_coarse_bits (int): Number of coarse HZ bits per axis.
     """
 
     def __init__(self, d_model: int, d_state: int = 64,
                  d_conv: int = 4, expand: int = 2,
-                 slab_thickness: float = 5.0):
+                 slab_thickness: float = 5.0,
+                 serialization_order: str = 'slab',
+                 serialization_grid_size: float = 0.2,
+                 hz_coarse_bits: int = 1):
         super().__init__()
+        if serialization_order not in (
+                'slab', 'hilbert', 'hilbert-bidirectional', 'hilbert-identical',
+                'z-order', 'z-order-trans', 'hz-bidirectional', 'hz', 'hz-swap'):
+            raise ValueError(f'Unknown serialization order: {serialization_order}')
+        if serialization_grid_size <= 0:
+            raise ValueError('Serialization grid size must be positive')
+        if not isinstance(hz_coarse_bits, int) or not 1 <= hz_coarse_bits <= 20:
+            raise ValueError('HZ coarse bits must be between 1 and 20')
         self.slab_thickness = slab_thickness
+        self.serialization_order = serialization_order
+        self.serialization_grid_size = serialization_grid_size
+        self.hz_coarse_bits = hz_coarse_bits
         self.pre_norm   = nn.LayerNorm(d_model)
         self.final_norm = nn.LayerNorm(d_model)
         from mamba_ssm import Mamba
@@ -930,31 +961,55 @@ class SSMSpatialSelfLayer(nn.Module):
             List[Tensor]: Updated queries, same shapes as input.
         """
         outputs = []
+        single_scan = self.serialization_order in ('hz', 'hz-swap')
         for i, q in enumerate(queries):
             shortcut = q
             normed   = self.pre_norm(q)          # (Q, d)
             pos      = query_xyzs[i] if query_xyzs is not None else None
 
             if pos is not None and pos.shape[0] > 1:
-                ord_a = _spatial_sort(pos, self.slab_thickness, descending=False)
-                ord_b = _spatial_sort(pos, self.slab_thickness, descending=True)
+                if self.serialization_order in ('hz-bidirectional', 'hz', 'hz-swap'):
+                    mode = 'hz-swap' if self.serialization_order == 'hz-swap' else 'hz'
+                    ord_a = hz_sort(pos, self.serialization_grid_size,
+                                    mode=mode, coarse_bits=self.hz_coarse_bits)
+                    ord_b = None if single_scan else ord_a.flip(0)
+                elif self.serialization_order in ('z-order', 'z-order-trans'):
+                    ord_a = z_order_sort(pos, self.serialization_grid_size)
+                    ord_b = (z_order_sort(
+                        pos, self.serialization_grid_size, transposed=True)
+                        if self.serialization_order == 'z-order-trans' else ord_a)
+                elif self.serialization_order in (
+                        'hilbert', 'hilbert-bidirectional', 'hilbert-identical'):
+                    ord_a = hilbert_sort(pos, self.serialization_grid_size)
+                    if self.serialization_order == 'hilbert-bidirectional':
+                        ord_b = ord_a.flip(0)
+                    elif self.serialization_order == 'hilbert-identical':
+                        ord_b = ord_a
+                    else:
+                        ord_b = hilbert_sort(
+                            pos, self.serialization_grid_size, transposed=True)
+                else:
+                    ord_a = _spatial_sort(pos, self.slab_thickness, descending=False)
+                    ord_b = _spatial_sort(pos, self.slab_thickness, descending=True)
             else:
                 n     = q.shape[0]
                 ord_a = torch.arange(n, device=q.device)
-                ord_b = torch.arange(n - 1, -1, -1, device=q.device)
+                ord_b = (ord_a if self.serialization_order in ('hilbert-identical', 'z-order')
+                         else torch.arange(n - 1, -1, -1, device=q.device))
+                if single_scan:
+                    ord_b = None
 
             inv_a = torch.argsort(ord_a)
-            inv_b = torch.argsort(ord_b)
-
-            # Stack both orderings as batch dim → (2, Q, d)
-            # ONE shared Mamba scans both orderings simultaneously (same weights)
-            stacked = torch.stack([normed[ord_a], normed[ord_b]], dim=0)
-            out     = self.mamba(stacked)        # (2, Q, d)
-
-            # Unsort each ordering back to original positions then average
-            out_a = out[0][inv_a]                # (Q, d)
-            out_b = out[1][inv_b]                # (Q, d)
-            q_out = (out_a + out_b) / 2          # average — paper: sum/len
+            if ord_b is None:
+                # A single scan really uses one sequence, without duplication.
+                out = self.mamba(normed[ord_a].unsqueeze(0))
+                q_out = out[0][inv_a]
+            else:
+                inv_b = torch.argsort(ord_b)
+                # Both directions/orderings share one Mamba instance.
+                stacked = torch.stack([normed[ord_a], normed[ord_b]], dim=0)
+                out = self.mamba(stacked)
+                q_out = (out[0][inv_a] + out[1][inv_b]) / 2
 
             q_out = self.final_norm(shortcut + q_out)
             outputs.append(q_out)
@@ -971,7 +1026,7 @@ class ForAINetv2SSMQueryDecoder_XAwarequery(BaseModule):
        cross-attention.  Uses spatial 3-D KNN when ``src_xyzs`` / ``query_xyzs``
        are supplied; falls back to feature-space KNN otherwise.
     2. **SSMSpatialSelfLayer** — two-ordering spatial SSM replacing self-
-       attention.  Sorts queries by complementary slab-order curves and
+       attention. Sorts queries by the configured spatial curves and
        averages the Mamba outputs.
     3. **FFN** — standard two-layer feed-forward network.
 
@@ -990,6 +1045,15 @@ class ForAINetv2SSMQueryDecoder_XAwarequery(BaseModule):
         d_conv (int): Mamba depthwise-conv kernel width.
         expand (int): Mamba inner expansion factor.
         slab_thickness (float): Z-axis bin width for spatial serialisation.
+        serialization_order (str): 'slab', 'hilbert' (two transposed curves),
+            'hilbert-bidirectional' (one curve scanned both ways), or
+            'hilbert-identical' (the same forward curve scanned twice), or
+            'z-order' (the same forward Morton curve scanned twice), or
+            'z-order-trans' (Morton and X/Y-transposed Morton curves),
+            'hz-bidirectional' (HZ forward/reverse), 'hz' (single HZ), or
+            'hz-swap' (single HZ with X/Y swapped).
+        serialization_grid_size (float): XYZ quantization size for spatial curves.
+        hz_coarse_bits (int): Number of coarse HZ bits per axis.
         hidden_dim (int): FFN hidden dimension.
         dropout (float): Dropout rate.
         activation_fn (str): FFN activation ('relu' or 'gelu').
@@ -1003,6 +1067,8 @@ class ForAINetv2SSMQueryDecoder_XAwarequery(BaseModule):
                  iter_pred, attn_mask, objectness_flag,
                  k=8, d_state=64, d_conv=4, expand=2,
                  slab_thickness=5.0,
+                 serialization_order='slab', serialization_grid_size=0.2,
+                 hz_coarse_bits=1,
                  hidden_dim=1024, dropout=0.0, activation_fn='gelu',
                  **kwargs):
         super().__init__()
@@ -1029,7 +1095,9 @@ class ForAINetv2SSMQueryDecoder_XAwarequery(BaseModule):
         for _ in range(num_layers):
             self.agg_layers.append(MambaAggregation(d_model, k, dropout))
             self.ssm_layers.append(
-                SSMSpatialSelfLayer(d_model, d_state, d_conv, expand, slab_thickness))
+                SSMSpatialSelfLayer(
+                    d_model, d_state, d_conv, expand, slab_thickness,
+                    serialization_order, serialization_grid_size, hz_coarse_bits))
             self.ffn_layers.append(FFN(d_model, hidden_dim, dropout, activation_fn))
 
         self.out_norm = nn.LayerNorm(d_model)
